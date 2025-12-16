@@ -2,6 +2,7 @@ package com.japonbaligi.mp3downloader
 
 import android.content.ContentValues
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -166,7 +167,11 @@ class MainActivity : ComponentActivity() {
                 val downloadedPath = module.callAttr("download_audio", videoUrl, cacheDir.absolutePath).toString()
 
                 val inputFile = File(downloadedPath)
-                val outputFile = File(cacheDir, inputFile.nameWithoutExtension + ".mp3")
+                
+                // Use app-private external storage for ffmpeg output
+                val musicDir = activity.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
+                    ?: throw IllegalStateException("External music directory not available")
+                val outputFile = File(musicDir, inputFile.nameWithoutExtension + ".mp3")
 
                 // Convert to MP3
                 activity.runOnUiThread { onStatusUpdate("MP3'e dönüştürülüyor...") }
@@ -176,7 +181,7 @@ class MainActivity : ComponentActivity() {
                 isDownloading = false
 
                 if (session.returnCode.isValueSuccess) {
-                    saveToDownloads(outputFile)
+                    saveToMediaStore(activity, outputFile)
                     callback(true, "Tamamlandı: ${outputFile.name}")
                 } else {
                     callback(false, "Dönüştürme hatası!")
@@ -188,26 +193,45 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun saveToDownloads(outputFile: File) {
+    /**
+     * Saves an MP3 file from app-private storage to MediaStore.
+     * The file must already exist in app-private storage (getExternalFilesDir).
+     * 
+     * Flow:
+     * 1. Insert MediaStore entry with IS_PENDING=1
+     * 2. Copy file from app-private storage to MediaStore OutputStream
+     * 3. Update MediaStore entry with IS_PENDING=0 to make it visible
+     */
+    private fun saveToMediaStore(activity: ComponentActivity, mp3File: File) {
         val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, outputFile.name)
+            put(MediaStore.Audio.Media.DISPLAY_NAME, mp3File.name)
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Mp3Downloader")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC)
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }
 
-        val resolver = contentResolver
+        val resolver = activity.contentResolver
         val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Failed to create MediaStore entry")
 
-        uri?.let {
-            resolver.openOutputStream(it)?.use { outStream ->
-                FileInputStream(outputFile).use { inStream ->
+        try {
+            // Copy file from app-private storage to MediaStore
+            resolver.openOutputStream(uri)?.use { outStream ->
+                FileInputStream(mp3File).use { inStream ->
                     inStream.copyTo(outStream)
+                    outStream.flush()
                 }
+            } ?: throw IllegalStateException("Failed to open MediaStore OutputStream")
+
+            // Mark as complete - file is now visible in Music library
+            val updateValues = ContentValues().apply {
+                put(MediaStore.Audio.Media.IS_PENDING, 0)
             }
-            values.clear()
-            values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-            resolver.update(it, values, null, null)
+            resolver.update(uri, updateValues, null, null)
+        } catch (e: Exception) {
+            // Clean up on failure
+            resolver.delete(uri, null, null)
+            throw e
         }
     }
 }
