@@ -15,13 +15,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.lifecycleScope
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.arthenica.ffmpegkit.FFmpegKit
+import kotlinx.coroutines.*
 import java.io.File
 import java.io.FileInputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity() {
+    private var downloadJob: Job? = null
+    private var progressJob: Job? = null
+    private val downloadingFlag = AtomicBoolean(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -29,8 +36,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        downloadJob?.cancel()
+        progressJob?.cancel()
+        downloadingFlag.set(false)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        downloadJob?.cancel()
+        progressJob?.cancel()
+        downloadingFlag.set(false)
+    }
+
     @Composable
-    fun YouTubeBrowserUI(activity: ComponentActivity) {
+    fun YouTubeBrowserUI(activity: MainActivity) {
         var currentUrl by remember { mutableStateOf<String?>(null) }
         var isVideoPage by remember { mutableStateOf(false) }
         var isDownloading by remember { mutableStateOf(false) }
@@ -43,7 +64,6 @@ class MainActivity : ComponentActivity() {
                     WebView(context).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        settings.userAgentString = "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36"
                         
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -71,7 +91,7 @@ class MainActivity : ComponentActivity() {
                             status = "İndiriliyor..."
                             progress = 0f
                             downloadAndConvertToMp3(
-                                normalizedUrl, 
+                                normalizedUrl,
                                 activity,
                                 { newStatus -> status = newStatus },
                                 { newProgress -> progress = newProgress },
@@ -113,7 +133,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     if (progress > 0f && progress < 1f) {
                         LinearProgressIndicator(
-                            progress = { progress },
+                            progress = progress,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -127,17 +147,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadAndConvertToMp3(
-        videoUrl: String, 
-        activity: ComponentActivity, 
+        videoUrl: String,
+        activity: MainActivity,
         onStatusUpdate: (String) -> Unit,
         onProgressUpdate: (Float) -> Unit,
         callback: (Boolean, String) -> Unit
     ) {
-        var isDownloading = true
-        
-        // Progress tracking thread
-        Thread {
-            while (isDownloading) {
+        downloadJob?.cancel()
+        progressJob?.cancel()
+        progressJob = null
+        downloadingFlag.set(true)
+
+        // Progress polling coroutine
+        progressJob = activity.lifecycleScope.launch(Dispatchers.IO) {
+            while (downloadingFlag.get() && isActive) {
                 try {
                     val py = Python.getInstance()
                     val module: PyObject = py.getModule("downloader")
@@ -148,65 +171,94 @@ class MainActivity : ComponentActivity() {
                     val total = (progObj["total"] as? Number)?.toLong() ?: 1L
                     val percent = if (total > 0) downloaded.toFloat() / total.toFloat() else 0f
 
-                    activity.runOnUiThread { onProgressUpdate(percent) }
-                    Thread.sleep(500)
-                } catch (_: Exception) {
-                    break
+                    withContext(Dispatchers.Main) {
+                        onProgressUpdate(percent)
+                    }
+                    delay(500)
+                } catch (e: Exception) {
+                    if (e !is CancellationException) {
+                        break
+                    }
+                    throw e
                 }
             }
-        }.start()
+        }
 
-        // Download and convert thread
-        Thread {
+        // Download and convert coroutine
+        downloadJob = activity.lifecycleScope.launch(Dispatchers.IO) {
+            var inputFile: File? = null
             try {
                 val py = Python.getInstance()
                 val module: PyObject = py.getModule("downloader")
 
                 // Download audio
-                activity.runOnUiThread { onStatusUpdate("İndiriliyor...") }
+                withContext(Dispatchers.Main) {
+                    onStatusUpdate("İndiriliyor...")
+                }
                 val downloadedPath = module.callAttr("download_audio", videoUrl, cacheDir.absolutePath).toString()
 
-                val inputFile = File(downloadedPath)
-                
+                inputFile = File(downloadedPath)
+
                 // Use app-private external storage for ffmpeg output
                 val musicDir = activity.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
                     ?: throw IllegalStateException("External music directory not available")
                 val outputFile = File(musicDir, inputFile.nameWithoutExtension + ".mp3")
 
                 // Convert to MP3
-                activity.runOnUiThread { onStatusUpdate("MP3'e dönüştürülüyor...") }
-                val cmd = "-i \"${inputFile.absolutePath}\" -vn -ar 44100 -ac 2 -b:a 192k \"${outputFile.absolutePath}\""
+                withContext(Dispatchers.Main) {
+                    onStatusUpdate("MP3'e dönüştürülüyor...")
+                }
+                val cmd = "-y -i \"${inputFile.absolutePath}\" -map_metadata 0 -vn -ar 44100 -ac 2 -b:a 192k \"${outputFile.absolutePath}\""
                 val session = FFmpegKit.execute(cmd)
-
-                isDownloading = false
 
                 if (session.returnCode.isValueSuccess) {
                     saveToMediaStore(activity, outputFile)
-                    callback(true, "Tamamlandı: ${outputFile.name}")
+                    withContext(Dispatchers.Main) {
+                        callback(true, "Tamamlandı: ${outputFile.name}")
+                    }
                 } else {
-                    callback(false, "Dönüştürme hatası!")
+                    val errorMessage =
+                        session.failStackTrace
+                            ?: session.allLogsAsString
+                            ?: "FFmpeg conversion failed"
+                    withContext(Dispatchers.Main) {
+                        callback(false, errorMessage)
+                    }
                 }
             } catch (e: Exception) {
-                isDownloading = false
-                callback(false, "Hata: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    callback(false, "Hata: ${e.message}")
+                }
+            } finally {
+                downloadingFlag.set(false)
+                progressJob?.cancel()
+                progressJob = null
+                inputFile?.delete()
             }
-        }.start()
+        }
     }
 
     /**
      * Saves an MP3 file from app-private storage to MediaStore.
      * The file must already exist in app-private storage (getExternalFilesDir).
-     * 
+     *
      * Flow:
      * 1. Insert MediaStore entry with IS_PENDING=1
      * 2. Copy file from app-private storage to MediaStore OutputStream
      * 3. Update MediaStore entry with IS_PENDING=0 to make it visible
+     * 4. Delete temporary app-private file on success
      */
     private fun saveToMediaStore(activity: ComponentActivity, mp3File: File) {
+        val now = System.currentTimeMillis() / 1000
         val values = ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, mp3File.name)
             put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
-            put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC)
+            put(
+                MediaStore.Audio.Media.RELATIVE_PATH,
+                "${Environment.DIRECTORY_MUSIC}/Mp3Downloader"
+            )
+            put(MediaStore.Audio.Media.DATE_ADDED, now)
+            put(MediaStore.Audio.Media.DATE_MODIFIED, now)
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }
 
@@ -228,6 +280,9 @@ class MainActivity : ComponentActivity() {
                 put(MediaStore.Audio.Media.IS_PENDING, 0)
             }
             resolver.update(uri, updateValues, null, null)
+
+            // Delete temporary app-private file after successful MediaStore export
+            mp3File.delete()
         } catch (e: Exception) {
             // Clean up on failure
             resolver.delete(uri, null, null)
